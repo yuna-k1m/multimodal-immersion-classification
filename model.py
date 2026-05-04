@@ -1,227 +1,151 @@
-"""
-FusionModel: Multimodal Biosignal-Based Immersion Level Classification
------------------------------------------------------------------------
-Architecture:
-  - EEG branch  : EEGNet (depthwise + separable conv)
-  - GSR branch  : 1D CNN
-  - PPG branch  : 1D CNN
-  - Fusion      : Concatenation → Modality Attention → Binary classifier
-
-Input shapes (per batch):
-  eeg : (B, 1, EEG_CHANNELS, T)   default EEG_CHANNELS=14
-  gsr : (B, 1, T)
-  ppg : (B, 1, T)
-
-NOTE: Adjust EEG_CHANNELS if your dataset uses a different montage.
-"""
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
-# ──────────────────────────────────────────────
-# 1. EEG Encoder  (EEGNet)
-# ──────────────────────────────────────────────
-class EEGNet(nn.Module):
-    """
-    Compact EEGNet encoder.
-    Ref: Lawhern et al., 2018 (simplified for binary classification pipeline).
-    """
-    def __init__(self, eeg_channels: int = 14, samples: int = 128,
-                 F1: int = 8, D: int = 2, F2: int = 16, dropout: float = 0.5):
+def to_channels_first(x: torch.Tensor) -> torch.Tensor:
+    """Convert common biosignal tensor shapes to [batch, channels, time]."""
+    x = x.float()
+
+    if x.dim() == 2:
+        return x.unsqueeze(1)
+
+    if x.dim() == 3:
+        batch, dim1, dim2 = x.shape
+        if dim1 > dim2 and dim2 <= 64:
+            return x.transpose(1, 2)
+        return x
+
+    if x.dim() == 4:
+        if x.size(1) == 1:
+            return x.squeeze(1)
+        if x.size(-1) == 1:
+            return x.squeeze(-1)
+
+        batch = x.size(0)
+        time = x.size(-1)
+        return x.reshape(batch, -1, time)
+
+    if x.dim() > 4:
+        batch = x.size(0)
+        time = x.size(-1)
+        return x.reshape(batch, -1, time)
+
+    raise ValueError(f"Expected input with at least 2 dimensions, got shape {tuple(x.shape)}")
+
+
+class EEGNetEncoder(nn.Module):
+    """Compact EEG encoder inspired by EEGNet-style temporal/depthwise filtering."""
+
+    def __init__(self, feature_dim: int = 128, dropout: float = 0.5) -> None:
         super().__init__()
-        self.temporal_conv = nn.Sequential(
-            nn.Conv2d(1, F1, kernel_size=(1, 64), padding=(0, 32), bias=False),
-            nn.BatchNorm2d(F1),
-        )
-        self.depthwise_conv = nn.Sequential(
-            nn.Conv2d(F1, F1 * D, kernel_size=(eeg_channels, 1),
-                      groups=F1, bias=False),
-            nn.BatchNorm2d(F1 * D),
+
+        self.encoder = nn.Sequential(
+            nn.LazyConv1d(16, kernel_size=64, padding=32, bias=False),
+            nn.BatchNorm1d(16),
             nn.ELU(),
-            nn.AvgPool2d(kernel_size=(1, 4)),
+            nn.AvgPool1d(kernel_size=4),
             nn.Dropout(dropout),
-        )
-        self.separable_conv = nn.Sequential(
-            nn.Conv2d(F1 * D, F2, kernel_size=(1, 16), padding=(0, 8), bias=False),
-            nn.BatchNorm2d(F2),
+            nn.Conv1d(16, 32, kernel_size=16, padding=8, groups=16, bias=False),
+            nn.BatchNorm1d(32),
             nn.ELU(),
-            nn.AvgPool2d(kernel_size=(1, 8)),
+            nn.AvgPool1d(kernel_size=4),
             nn.Dropout(dropout),
+            nn.Conv1d(32, 64, kernel_size=8, padding=4, bias=False),
+            nn.BatchNorm1d(64),
+            nn.ELU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(64, feature_dim),
+            nn.ReLU(),
         )
-        # compute flattened feature size
-        self._feature_dim = self._get_feature_dim(eeg_channels, samples, F1, D, F2)
 
-    def _get_feature_dim(self, eeg_channels, samples, F1, D, F2):
-        with torch.no_grad():
-            x = torch.zeros(1, 1, eeg_channels, samples)
-            x = self.temporal_conv(x)
-            x = self.depthwise_conv(x)
-            x = self.separable_conv(x)
-            return x.view(1, -1).shape[1]
-
-    def forward(self, x):
-        # x: (B, 1, eeg_channels, T)
-        x = self.temporal_conv(x)
-        x = self.depthwise_conv(x)
-        x = self.separable_conv(x)
-        return x.view(x.size(0), -1)   # (B, feature_dim)
-
-    @property
-    def output_dim(self):
-        return self._feature_dim
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = to_channels_first(x)
+        return self.encoder(x)
 
 
-# ──────────────────────────────────────────────
-# 2. Peripheral Signal Encoder  (1D CNN)
-#    shared architecture for GSR and PPG
-# ──────────────────────────────────────────────
-class SignalEncoder1D(nn.Module):
-    def __init__(self, in_channels: int = 1, out_dim: int = 64,
-                 dropout: float = 0.3):
+class Conv1DEncoder(nn.Module):
+    """1D CNN encoder for single- or multi-channel physiological signals."""
+
+    def __init__(self, feature_dim: int = 128, dropout: float = 0.5) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv1d(in_channels, 32, kernel_size=7, padding=3),
+
+        self.encoder = nn.Sequential(
+            nn.LazyConv1d(32, kernel_size=7, padding=3, bias=False),
             nn.BatchNorm1d(32),
             nn.ReLU(),
-            nn.MaxPool1d(2),
-
-            nn.Conv1d(32, 64, kernel_size=5, padding=2),
+            nn.MaxPool1d(kernel_size=2),
+            nn.Dropout(dropout),
+            nn.Conv1d(32, 64, kernel_size=5, padding=2, bias=False),
             nn.BatchNorm1d(64),
             nn.ReLU(),
-            nn.MaxPool1d(2),
-
-            nn.Conv1d(64, out_dim, kernel_size=3, padding=1),
-            nn.BatchNorm1d(out_dim),
+            nn.MaxPool1d(kernel_size=2),
+            nn.Dropout(dropout),
+            nn.Conv1d(64, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1),   # → (B, out_dim, 1)
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(128, feature_dim),
+            nn.ReLU(),
         )
-        self.dropout = nn.Dropout(dropout)
-        self._out_dim = out_dim
 
-    def forward(self, x):
-        # x: (B, 1, T)
-        x = self.net(x)
-        x = x.squeeze(-1)           # (B, out_dim)
-        return self.dropout(x)
-
-    @property
-    def output_dim(self):
-        return self._out_dim
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = to_channels_first(x)
+        return self.encoder(x)
 
 
-# ──────────────────────────────────────────────
-# 3. Modality Attention
-# ──────────────────────────────────────────────
 class ModalityAttention(nn.Module):
-    """
-    Learns a scalar attention weight for each modality feature vector,
-    then returns a weighted sum over the concatenated representation.
-    """
-    def __init__(self, eeg_dim: int, gsr_dim: int, ppg_dim: int):
+    """Attention-based fusion over EEG, GSR, and PPG feature vectors."""
+
+    def __init__(self, feature_dim: int = 128, hidden_dim: int = 64) -> None:
         super().__init__()
-        self.eeg_proj = nn.Linear(eeg_dim, 1)
-        self.gsr_proj = nn.Linear(gsr_dim, 1)
-        self.ppg_proj = nn.Linear(ppg_dim, 1)
 
-    def forward(self, f_eeg, f_gsr, f_ppg):
-        # scalar score per modality
-        scores = torch.cat([
-            self.eeg_proj(f_eeg),   # (B, 1)
-            self.gsr_proj(f_gsr),   # (B, 1)
-            self.ppg_proj(f_ppg),   # (B, 1)
-        ], dim=1)                   # (B, 3)
-        weights = F.softmax(scores, dim=1)  # (B, 3)
-
-        # weighted features (broadcast over feature dim)
-        attended = (
-            weights[:, 0:1] * f_eeg +
-            weights[:, 1:2] * f_gsr +   # requires same dim → projected below
-            weights[:, 2:3] * f_ppg
+        self.score_layer = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1),
         )
-        return attended, weights        # return weights for interpretability
+
+    def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        scores = self.score_layer(features)
+        weights = torch.softmax(scores, dim=1)
+        fused = torch.sum(features * weights, dim=1)
+        return fused, weights
 
 
-# ──────────────────────────────────────────────
-# 4. FusionModel  (top-level)
-# ──────────────────────────────────────────────
 class FusionModel(nn.Module):
-    """
-    Full multimodal fusion model.
+    """Multimodal binary classifier using EEG, GSR, and PPG inputs."""
 
-    Forward inputs:
-        eeg : (B, 1, EEG_CHANNELS, T)
-        gsr : (B, 1, T)
-        ppg : (B, 1, T)
-
-    Returns:
-        logits  : (B, 1)   — use BCEWithLogitsLoss during training
-        weights : (B, 3)   — modality attention weights [eeg, gsr, ppg]
-    """
-    def __init__(self,
-                 eeg_channels: int = 14,   # ← adjust if needed
-                 eeg_samples:  int = 128,
-                 peripheral_dim: int = 64,
-                 hidden_dim: int = 128,
-                 dropout: float = 0.4):
+    def __init__(self, feature_dim: int = 128, dropout: float = 0.5) -> None:
         super().__init__()
 
-        # encoders
-        self.eeg_enc = EEGNet(eeg_channels=eeg_channels, samples=eeg_samples)
-        self.gsr_enc = SignalEncoder1D(out_dim=peripheral_dim)
-        self.ppg_enc = SignalEncoder1D(out_dim=peripheral_dim)
+        self.eeg_encoder = EEGNetEncoder(feature_dim=feature_dim, dropout=dropout)
+        self.gsr_encoder = Conv1DEncoder(feature_dim=feature_dim, dropout=dropout)
+        self.ppg_encoder = Conv1DEncoder(feature_dim=feature_dim, dropout=dropout)
+        self.fusion = ModalityAttention(feature_dim=feature_dim)
 
-        eeg_dim = self.eeg_enc.output_dim
-
-        # project all features to the same dim before attention weighted sum
-        self.eeg_proj = nn.Linear(eeg_dim, hidden_dim)
-        self.gsr_proj = nn.Linear(peripheral_dim, hidden_dim)
-        self.ppg_proj = nn.Linear(peripheral_dim, hidden_dim)
-
-        # modality attention (operates on projected features)
-        self.attention = ModalityAttention(hidden_dim, hidden_dim, hidden_dim)
-
-        # classifier head
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
+            nn.Linear(feature_dim, 64),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(64, 1),   # binary logit
+            nn.Linear(64, 1),
         )
 
-    def forward(self, eeg, gsr, ppg):
-        # encode each modality
-        f_eeg = self.eeg_enc(eeg)           # (B, eeg_dim)
-        f_gsr = self.gsr_enc(gsr)           # (B, peripheral_dim)
-        f_ppg = self.ppg_enc(ppg)           # (B, peripheral_dim)
+    def forward(
+        self,
+        eeg: torch.Tensor,
+        gsr: torch.Tensor,
+        ppg: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        eeg_feature = self.eeg_encoder(eeg)
+        gsr_feature = self.gsr_encoder(gsr)
+        ppg_feature = self.ppg_encoder(ppg)
 
-        # project to shared space
-        f_eeg = F.relu(self.eeg_proj(f_eeg))    # (B, hidden_dim)
-        f_gsr = F.relu(self.gsr_proj(f_gsr))    # (B, hidden_dim)
-        f_ppg = F.relu(self.ppg_proj(f_ppg))    # (B, hidden_dim)
+        features = torch.stack([eeg_feature, gsr_feature, ppg_feature], dim=1)
+        fused_feature, attention_weights = self.fusion(features)
+        logits = self.classifier(fused_feature)
 
-        # modality attention → weighted sum
-        fused, attn_weights = self.attention(f_eeg, f_gsr, f_ppg)  # (B, hidden_dim)
-
-        # classify
-        logits = self.classifier(fused)     # (B, 1)
-        return logits, attn_weights
-
-
-# ──────────────────────────────────────────────
-# Quick sanity check
-# ──────────────────────────────────────────────
-if __name__ == "__main__":
-    B, T = 4, 128
-    eeg = torch.randn(B, 1, 14, T)
-    gsr = torch.randn(B, 1, T)
-    ppg = torch.randn(B, 1, T)
-
-    model = FusionModel()
-    logits, weights = model(eeg, gsr, ppg)
-
-    print(f"logits  : {logits.shape}")    # (4, 1)
-    print(f"weights : {weights.shape}")   # (4, 3)
-    print(f"attention weights (sample 0): {weights[0].detach()}")
-    print("Model parameters:", sum(p.numel() for p in model.parameters()))
+        return logits, attention_weights
