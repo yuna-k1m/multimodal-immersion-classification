@@ -52,7 +52,8 @@ Classification Report (Test set):
 .
 ├── model.py        # FusionModel: EEGNet + 1D CNN + Modality Attention
 ├── Dataset.py      # BiosignalDataset: loads sliced .npy windows
-├── train.py        # Training loop with early stopping
+├── train.py        # Training script with early stopping (CLI)
+├── train.ipynb     # Training notebook (interactive)
 ├── requirements.txt
 └── README.md
 ```
@@ -64,10 +65,14 @@ Classification Report (Test set):
 ```bash
 pip install -r requirements.txt
 
+# Script
 python train.py
+
+# Notebook
+jupyter notebook train.ipynb
 ```
 
-> **Note**: Update `data_dir` and `split_dir` paths in `train.py` to point to your local dataset before running.
+> **Note**: Update `data_dir` and `split_dir` paths in `train.py` or `train.ipynb` to point to your local dataset before running.
 
 ---
 
